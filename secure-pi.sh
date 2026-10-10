@@ -379,8 +379,8 @@ step_toolchain() {
     log "== toolchain =="
     local target_user target_home
     # Auto-detect the invoking human: sudo exposes them as SUDO_USER.
-    # Plain whoami under sudo would report "root" and install bun/rustup
-    # into /root instead of the real user's home.
+    # Plain whoami under sudo would report "root" and install the node
+    # toolchain/rustup into /root instead of the real user's home.
     if [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != "root" ]; then
         target_user="$SUDO_USER"
     else
@@ -410,23 +410,43 @@ step_toolchain() {
         build-essential python3 python3-venv python3-pip default-jdk gh
     ok "apt toolchain packages installed"
 
-    # Per-user installs MUST run as the target user, never root: bun/rustup
+    # Per-user installs MUST run as the target user, never root: nvm/rustup
     # install into $HOME and patch that user's .bashrc; as root they would
     # pollute /root and leave the real user without the toolchain.
-    run runuser -u "$target_user" -- bash -c 'curl -fsSL https://bun.sh/install | bash'
-    ok "bun installed for $target_user"
-    run runuser -u "$target_user" -- "$target_home/.bun/bin/bun" install -g vercel
-    ok "vercel CLI installed for $target_user"
+    # Node + npm via nvm: always the latest release (the nvm installer
+    # writes its own PATH lines into .bashrc), then npm itself upgraded to
+    # latest. Replaces the old bun-based toolchain; npm is now the package manager.
+    run runuser -u "$target_user" -- bash -c 'curl -fsSL https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.3/install.sh | bash'
+    ok "nvm installed for $target_user"
+    run runuser -u "$target_user" -- bash -c 'export NVM_DIR="$HOME/.nvm"; . "$NVM_DIR/nvm.sh"; nvm install node; nvm alias default node'
+    ok "latest node installed for $target_user"
+    run runuser -u "$target_user" -- bash -c 'export NVM_DIR="$HOME/.nvm"; . "$NVM_DIR/nvm.sh"; npm install -g npm@latest'
+    ok "npm upgraded to latest for $target_user"
+    run runuser -u "$target_user" -- bash -c 'export NVM_DIR="$HOME/.nvm"; . "$NVM_DIR/nvm.sh"; npm install -g vercel'
+    ok "vercel CLI installed for $target_user (npm)"
+    # opencode: official installer, per-user, binary lands in
+    # $HOME/.opencode/bin (the installer also appends its own PATH line).
+    run runuser -u "$target_user" -- bash -c 'curl -fsSL https://opencode.ai/v2/install | bash'
+    ok "opencode installed for $target_user"
     run runuser -u "$target_user" -- bash -c "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal"
     ok "rustup stable/minimal installed for $target_user"
 
-    # Idempotent PATH marker in the target user's .bashrc.
+    # Idempotent PATH marker in the target user's .bashrc. nvm manages its
+    # own PATH lines; we only need cargo + opencode bin here.
     local bashrc="${target_home}/.bashrc"
-    local marker='export PATH="$HOME/.bun/bin:$HOME/.cargo/bin:$PATH"'
+    local marker='export PATH="$HOME/.cargo/bin:$HOME/.opencode/bin:$PATH"'
     if [ "$DRY_RUN" -eq 1 ]; then
-        printf '[dry-run] ensure PATH marker in %s\n' "$bashrc"
+        printf '[dry-run] ensure PATH marker in %s (drop legacy bun marker)\n' "$bashrc"
     else
-        if [ -f "$bashrc" ] && grep -qF '.bun/bin' "$bashrc"; then
+        # Remove the legacy bun marker left by older versions of this script.
+        # Fixed-string match on the marker prefix only: never touches lines
+        # a user added by hand (e.g. their own BUN_INSTALL exports).
+        if [ -f "$bashrc" ] && grep -qF 'export PATH="$HOME/.bun/bin' "$bashrc" 2>/dev/null; then
+            backup_file "$bashrc"
+            run runuser -u "$target_user" -- bash -c "grep -vF 'export PATH=\"\$HOME/.bun/bin' '$bashrc' > '$bashrc.sp' && mv '$bashrc.sp' '$bashrc'"
+            log "removed legacy bun PATH marker from $bashrc"
+        fi
+        if [ -f "$bashrc" ] && grep -qF '.opencode/bin' "$bashrc"; then
             log "PATH marker already in $bashrc"
         else
             backup_file "$bashrc"
@@ -441,13 +461,68 @@ step_toolchain() {
     fi
 
     # Version proof (informational; individual misses warn, not fail).
+    # node/npm/vercel live inside nvm, so source nvm.sh before calling them.
     if [ "$DRY_RUN" -eq 1 ]; then
-        printf '[dry-run] print versions: bun, rustc, vercel, gh\n'
+        printf '[dry-run] print versions: node, npm, rustc, vercel, opencode, gh\n'
     else
-        run_allow_fail runuser -u "$target_user" -- "$target_home/.bun/bin/bun" --version || warn "bun version check failed"
+        run_allow_fail runuser -u "$target_user" -- bash -c 'export NVM_DIR="$HOME/.nvm"; . "$NVM_DIR/nvm.sh"; node --version' || warn "node version check failed"
+        run_allow_fail runuser -u "$target_user" -- bash -c 'export NVM_DIR="$HOME/.nvm"; . "$NVM_DIR/nvm.sh"; npm --version' || warn "npm version check failed"
         run_allow_fail runuser -u "$target_user" -- "$target_home/.cargo/bin/rustc" --version || warn "rustc version check failed"
-        run_allow_fail runuser -u "$target_user" -- "$target_home/.bun/bin/vercel" --version || warn "vercel version check failed"
+        run_allow_fail runuser -u "$target_user" -- bash -c 'export NVM_DIR="$HOME/.nvm"; . "$NVM_DIR/nvm.sh"; vercel --version' || warn "vercel version check failed"
+        run_allow_fail runuser -u "$target_user" -- "$target_home/.opencode/bin/opencode" --version || warn "opencode version check failed"
         run_allow_fail gh --version || warn "gh version check failed"
+    fi
+}
+
+# ============================================================ 10. skills ===
+# Install agent skills via the official skills.sh CLI. MUST run after
+# step_toolchain: npx (from nvm) is required. Copies land in the target
+# user's ~/.agents/skills, which OpenCode reads as a global source.
+step_skills() {
+    log "== agent skills (skills.sh) =="
+    local specs=(
+        vercel-labs/skills:find-skills
+        anthropics/skills:frontend-design
+        vercel-labs/agent-skills:web-design-guidelines
+        juliusbrussee/caveman:caveman
+        anthropics/skills:skill-creator
+        leonxlnx/taste-skill:minimalist-ui
+        supabase/agent-skills:supabase
+        shadcn-ui/ui:shadcn
+        anthropics/skills:pptx
+        cursor/plugins:unslop
+    )
+    local spec
+    for spec in "${specs[@]}"; do
+        install_skill "$spec"
+    done
+}
+
+# ------------------------------------------------------- skill installer ---
+# Install one agent skill from skills.sh via the official CLI, as the
+# target user, as the final provisioning stage. Each call is individually
+# guarded so one unavailable repo cannot abort the run (see AGENTS.md:
+# "run_allow_fail is for one call; loops need their own || guard").
+# $1 = repo:skill (e.g. vercel-labs/skills:find-skills).
+install_skill() {
+    local spec="$1" repo skill log="${TMPDIR:-/tmp}/skill-$$.log"
+    if [ "$DRY_RUN" -eq 1 ]; then
+        printf '[dry-run] skill: %s\n' "$spec"
+        return 0
+    fi
+    repo="${spec%%:*}"
+    skill="${spec##*:}"
+    # Success signal = CLI exit status (exactly one skill per call). The log
+    # is post-mortem only: do NOT grep the pretty output for success text —
+    # it prints a unicode checkmark line ("✓ <skill> (copied)") that is not
+    # a stable grep target and would false-warn on every success.
+    # nvm lands node/npx/vercel in the user's own nvm dir, so source nvm.sh
+    # first: a bare runuser shell has none of them on PATH.
+    if run_allow_fail runuser -u "$target_user" -- bash -c "export NVM_DIR=\"\$HOME/.nvm\"; . \"\$NVM_DIR/nvm.sh\"; npx --yes skills@latest add $repo --skill $skill --full-depth --global --agent opencode --yes" >>"$log" 2>&1; then
+        ok "skill installed: $skill ($repo)"
+        rm -f "$log"
+    else
+        warn "skill install failed: $skill ($repo) — see $log"
     fi
 }
 
@@ -463,6 +538,7 @@ main() {
     step_time
     step_disable_services
     step_toolchain
+    step_skills
 
     printf '\n===== SUMMARY =====\n'
     if [ "${#APPLIED[@]}" -gt 0 ]; then print_list "Applied" "${APPLIED[@]}"; else printf 'Applied (0):\n'; fi
@@ -472,6 +548,7 @@ main() {
     printf '  1. Keep this SSH session open; open a SECOND session to verify login works.\n'
     printf '  2. Check: ufw status verbose, fail2ban-client status sshd, auditctl -s.\n'
     printf '  3. Log out/in as the target user so ~/.bashrc PATH takes effect.\n'
+    printf '  4. Verify agent skills landed: ls ~/.agents/skills (OpenCode reads it as a global source).\n'
     if [ "$DRY_RUN" -eq 1 ]; then
         printf 'DRY-RUN: no changes were made.\n'
     else
