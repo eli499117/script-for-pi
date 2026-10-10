@@ -159,6 +159,23 @@ fi
 
 export DEBIAN_FRONTEND=noninteractive
 
+# ------------------------------------------------- target user resolution ---
+# Auto-detect the invoking human: sudo exposes them as SUDO_USER. Plain
+# whoami under sudo would report "root" and install the toolchain into
+# /root instead of the real user's home. Resolved once as a global because
+# several steps install per-user things (toolchain, skills, opencode updates).
+if [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != "root" ]; then
+    TARGET_USER="$SUDO_USER"
+else
+    TARGET_USER="$(whoami)"
+fi
+if [ "$TARGET_USER" = "root" ]; then
+    TARGET_HOME="/root"
+else
+    TARGET_HOME="$(getent passwd "$TARGET_USER" | cut -d: -f6)"
+    [ -n "$TARGET_HOME" ] || TARGET_HOME="/home/$TARGET_USER"
+fi
+
 # ============================================================ 1. system =====
 step_system() {
     log "== system update =="
@@ -377,22 +394,7 @@ step_disable_services() {
 # ============================================================ 9. toolchain ==
 step_toolchain() {
     log "== toolchain =="
-    local target_user target_home
-    # Auto-detect the invoking human: sudo exposes them as SUDO_USER.
-    # Plain whoami under sudo would report "root" and install the node
-    # toolchain/rustup into /root instead of the real user's home.
-    if [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != "root" ]; then
-        target_user="$SUDO_USER"
-    else
-        target_user="$(whoami)"
-    fi
-    if [ "$target_user" = "root" ]; then
-        target_home="/root"
-    else
-        target_home="$(getent passwd "$target_user" | cut -d: -f6)"
-        [ -n "$target_home" ] || target_home="/home/$target_user"
-    fi
-    log "target user: $target_user ($target_home)"
+    log "target user: $TARGET_USER ($TARGET_HOME)"
 
     # Warn-only disk check: 2GB floor before heavy installs, never abort.
     if [ "$DRY_RUN" -eq 1 ]; then
@@ -416,24 +418,24 @@ step_toolchain() {
     # Node + npm via nvm: always the latest release (the nvm installer
     # writes its own PATH lines into .bashrc), then npm itself upgraded to
     # latest. Replaces the old bun-based toolchain; npm is now the package manager.
-    run runuser -u "$target_user" -- bash -c 'curl -fsSL https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.3/install.sh | bash'
-    ok "nvm installed for $target_user"
-    run runuser -u "$target_user" -- bash -c 'export NVM_DIR="$HOME/.nvm"; . "$NVM_DIR/nvm.sh"; nvm install node; nvm alias default node'
-    ok "latest node installed for $target_user"
-    run runuser -u "$target_user" -- bash -c 'export NVM_DIR="$HOME/.nvm"; . "$NVM_DIR/nvm.sh"; npm install -g npm@latest'
-    ok "npm upgraded to latest for $target_user"
-    run runuser -u "$target_user" -- bash -c 'export NVM_DIR="$HOME/.nvm"; . "$NVM_DIR/nvm.sh"; npm install -g vercel'
-    ok "vercel CLI installed for $target_user (npm)"
+    run runuser -u "$TARGET_USER" -- bash -c 'curl -fsSL https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.3/install.sh | bash'
+    ok "nvm installed for $TARGET_USER"
+    run runuser -u "$TARGET_USER" -- bash -c 'export NVM_DIR="$HOME/.nvm"; . "$NVM_DIR/nvm.sh"; nvm install node; nvm alias default node'
+    ok "latest node installed for $TARGET_USER"
+    run runuser -u "$TARGET_USER" -- bash -c 'export NVM_DIR="$HOME/.nvm"; . "$NVM_DIR/nvm.sh"; npm install -g npm@latest'
+    ok "npm upgraded to latest for $TARGET_USER"
+    run runuser -u "$TARGET_USER" -- bash -c 'export NVM_DIR="$HOME/.nvm"; . "$NVM_DIR/nvm.sh"; npm install -g vercel'
+    ok "vercel CLI installed for $TARGET_USER (npm)"
     # opencode: official installer, per-user, binary lands in
     # $HOME/.opencode/bin (the installer also appends its own PATH line).
-    run runuser -u "$target_user" -- bash -c 'curl -fsSL https://opencode.ai/v2/install | bash'
-    ok "opencode installed for $target_user"
-    run runuser -u "$target_user" -- bash -c "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal"
-    ok "rustup stable/minimal installed for $target_user"
+    run runuser -u "$TARGET_USER" -- bash -c 'curl -fsSL https://opencode.ai/v2/install | bash'
+    ok "opencode installed for $TARGET_USER"
+    run runuser -u "$TARGET_USER" -- bash -c "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal"
+    ok "rustup stable/minimal installed for $TARGET_USER"
 
     # Idempotent PATH marker in the target user's .bashrc. nvm manages its
     # own PATH lines; we only need cargo + opencode bin here.
-    local bashrc="${target_home}/.bashrc"
+    local bashrc="${TARGET_HOME}/.bashrc"
     local marker='export PATH="$HOME/.cargo/bin:$HOME/.opencode/bin:$PATH"'
     if [ "$DRY_RUN" -eq 1 ]; then
         printf '[dry-run] ensure PATH marker in %s (drop legacy bun marker)\n' "$bashrc"
@@ -443,18 +445,18 @@ step_toolchain() {
         # a user added by hand (e.g. their own BUN_INSTALL exports).
         if [ -f "$bashrc" ] && grep -qF 'export PATH="$HOME/.bun/bin' "$bashrc" 2>/dev/null; then
             backup_file "$bashrc"
-            run runuser -u "$target_user" -- bash -c "grep -vF 'export PATH=\"\$HOME/.bun/bin' '$bashrc' > '$bashrc.sp' && mv '$bashrc.sp' '$bashrc'"
+            run runuser -u "$TARGET_USER" -- bash -c "grep -vF 'export PATH=\"\$HOME/.bun/bin' '$bashrc' > '$bashrc.sp' && mv '$bashrc.sp' '$bashrc'"
             log "removed legacy bun PATH marker from $bashrc"
         fi
         if [ -f "$bashrc" ] && grep -qF '.opencode/bin' "$bashrc"; then
             log "PATH marker already in $bashrc"
         else
             backup_file "$bashrc"
-            if [ "$target_user" = "root" ]; then
+            if [ "$TARGET_USER" = "root" ]; then
                 printf '%s\n' "$marker" >> "$bashrc"
             else
                 # Append as the user so ownership stays correct.
-                run runuser -u "$target_user" -- bash -c "printf '%s\n' '$marker' >> '$bashrc'"
+                run runuser -u "$TARGET_USER" -- bash -c "printf '%s\n' '$marker' >> '$bashrc'"
             fi
             log "appended PATH marker to $bashrc"
         fi
@@ -465,11 +467,11 @@ step_toolchain() {
     if [ "$DRY_RUN" -eq 1 ]; then
         printf '[dry-run] print versions: node, npm, rustc, vercel, opencode, gh\n'
     else
-        run_allow_fail runuser -u "$target_user" -- bash -c 'export NVM_DIR="$HOME/.nvm"; . "$NVM_DIR/nvm.sh"; node --version' || warn "node version check failed"
-        run_allow_fail runuser -u "$target_user" -- bash -c 'export NVM_DIR="$HOME/.nvm"; . "$NVM_DIR/nvm.sh"; npm --version' || warn "npm version check failed"
-        run_allow_fail runuser -u "$target_user" -- "$target_home/.cargo/bin/rustc" --version || warn "rustc version check failed"
-        run_allow_fail runuser -u "$target_user" -- bash -c 'export NVM_DIR="$HOME/.nvm"; . "$NVM_DIR/nvm.sh"; vercel --version' || warn "vercel version check failed"
-        run_allow_fail runuser -u "$target_user" -- "$target_home/.opencode/bin/opencode" --version || warn "opencode version check failed"
+        run_allow_fail runuser -u "$TARGET_USER" -- bash -c 'export NVM_DIR="$HOME/.nvm"; . "$NVM_DIR/nvm.sh"; node --version' || warn "node version check failed"
+        run_allow_fail runuser -u "$TARGET_USER" -- bash -c 'export NVM_DIR="$HOME/.nvm"; . "$NVM_DIR/nvm.sh"; npm --version' || warn "npm version check failed"
+        run_allow_fail runuser -u "$TARGET_USER" -- "$TARGET_HOME/.cargo/bin/rustc" --version || warn "rustc version check failed"
+        run_allow_fail runuser -u "$TARGET_USER" -- bash -c 'export NVM_DIR="$HOME/.nvm"; . "$NVM_DIR/nvm.sh"; vercel --version' || warn "vercel version check failed"
+        run_allow_fail runuser -u "$TARGET_USER" -- "$TARGET_HOME/.opencode/bin/opencode" --version || warn "opencode version check failed"
         run_allow_fail gh --version || warn "gh version check failed"
     fi
 }
@@ -518,12 +520,52 @@ install_skill() {
     # a stable grep target and would false-warn on every success.
     # nvm lands node/npx/vercel in the user's own nvm dir, so source nvm.sh
     # first: a bare runuser shell has none of them on PATH.
-    if run_allow_fail runuser -u "$target_user" -- bash -c "export NVM_DIR=\"\$HOME/.nvm\"; . \"\$NVM_DIR/nvm.sh\"; npx --yes skills@latest add $repo --skill $skill --full-depth --global --agent opencode --yes" >>"$log" 2>&1; then
+    if run_allow_fail runuser -u "$TARGET_USER" -- bash -c "export NVM_DIR=\"\$HOME/.nvm\"; . \"\$NVM_DIR/nvm.sh\"; npx --yes skills@latest add $repo --skill $skill --full-depth --global --agent opencode --yes" >>"$log" 2>&1; then
         ok "skill installed: $skill ($repo)"
         rm -f "$log"
     else
         warn "skill install failed: $skill ($repo) — see $log"
     fi
+}
+
+# ==================================================== 11. opencode updates =
+# unattended-upgrades (step 5) only ever touches apt packages. OpenCode is
+# NOT an apt package: the official installer put the binary in the target
+# user's ~/.opencode/bin, so no apt run will ever update it. This step
+# closes that gap with a systemd timer that re-runs the same official
+# installer, unattended, as the target user (systemd sets HOME for User=,
+# which is all the installer needs). Runs weekly; no interaction, and it
+# doubles as a repair path if the binary is ever deleted.
+step_opencode_update() {
+    log "== opencode auto-update (systemd timer) =="
+    write_file "/etc/systemd/system/opencode-update.service" <<EOF
+[Unit]
+Description=Update OpenCode CLI via the official installer
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=${TARGET_USER}
+ExecStart=/usr/bin/bash -c 'curl -fsSL https://opencode.ai/v2/install | bash'
+EOF
+
+    write_file "/etc/systemd/system/opencode-update.timer" <<EOF
+[Unit]
+Description=Weekly OpenCode CLI update
+
+[Timer]
+OnCalendar=weekly
+Persistent=true
+RandomizedDelaySec=1h
+
+[Install]
+WantedBy=timers.target
+EOF
+
+    run systemctl daemon-reload
+    run systemctl enable --now opencode-update.timer
+    ok "opencode auto-update timer enabled (weekly, runs as ${TARGET_USER})"
 }
 
 # ------------------------------------------------------------------ main ----
@@ -539,6 +581,7 @@ main() {
     step_disable_services
     step_toolchain
     step_skills
+    step_opencode_update
 
     printf '\n===== SUMMARY =====\n'
     if [ "${#APPLIED[@]}" -gt 0 ]; then print_list "Applied" "${APPLIED[@]}"; else printf 'Applied (0):\n'; fi
